@@ -141,6 +141,19 @@ def add_training_arguments(parser: argparse.ArgumentParser):
         default=42,
         help="Random seed",
     )
+    parser.add_argument(
+        "--use-test-dataset",
+        type=str2bool,
+        default=True,
+        help="Use synthetic test dataset (True) or real dataset (False)",
+    )
+    parser.add_argument(
+        "--dataset",
+        type=str,
+        default="aishell",
+        choices=["aishell", "all", "test"],
+        help="Which real dataset to use: aishell (single), all (multi-dataset), or test (synthetic)",
+    )
     # DeepSpeed arguments
     parser.add_argument(
         "--deepspeed",
@@ -460,10 +473,23 @@ def train_one_epoch(
             if params.training_stage == 1:
                 model.llm.eval()
 
-            logging.info(f"Epoch {params.cur_epoch}, validation loss: {valid_info.norm('loss'):.4f}")
+            # Enhanced validation logging
+            valid_loss = valid_info.norm('loss')
+            valid_msg = (
+                f"[VALIDATION] Epoch {params.cur_epoch:2d} | "
+                f"Loss: {valid_loss:.4f} | "
+                f"Batches: 10"
+            )
+
+            # Use both print and logging for rank 0
+            if rank == 0:
+                print(valid_msg, flush=True)
+            logging.info(valid_msg)
+            sys.stdout.flush()
 
             if tb_writer is not None and rank == 0:
-                valid_info.write_summary(tb_writer, "train/valid_", params.batch_idx_train)
+                tb_writer.add_scalar("valid/loss", valid_loss, params.batch_idx_train)
+                tb_writer.flush()
 
             # Save checkpoint
             if rank == 0:
@@ -482,20 +508,66 @@ def train_one_epoch(
         model.backward(loss)
         model.step()
 
-        tot_loss["loss"] = info["loss"]
+        # Get current loss as scalar
+        current_loss = loss.item()
+        tot_loss["loss"] = current_loss
 
-        # Logging
-        if batch_idx % params.log_interval == 0:
-            logging.info(
-                f"Epoch {params.cur_epoch}, batch {batch_idx}, "
-                f"loss: {tot_loss.norm('loss'):.4f}, "
-                f"batch_size: {batch_size}"
+        # Logging - log first 5 batches regardless of log_interval for debugging
+        should_log = (batch_idx % params.log_interval == 0) or (batch_idx < 5)
+
+        if should_log:
+            # Extract learning rate from DeepSpeed optimizer
+            try:
+                cur_lr = model.optimizer.param_groups[0]['lr']
+            except:
+                cur_lr = 0.0
+
+            # Get gradient norm from DeepSpeed
+            grad_norm = 0.0
+            if hasattr(model, 'get_global_grad_norm'):
+                try:
+                    grad_norm = model.get_global_grad_norm()
+                except:
+                    pass
+
+            # Get grad scale for FP16
+            grad_scale = 1.0
+            if hasattr(model, 'optimizer') and hasattr(model.optimizer, 'cur_scale'):
+                try:
+                    grad_scale = model.optimizer.cur_scale
+                except:
+                    pass
+
+            # Console logging - detailed format
+            log_msg = (
+                f"[TRAIN] Epoch {params.cur_epoch:2d} | "
+                f"Batch {batch_idx:4d} | "
+                f"Loss {current_loss:.4f} | "
+                f"Avg Loss {tot_loss.norm('loss'):.4f} | "
+                f"LR {cur_lr:.2e} | "
+                f"Grad Norm {grad_norm:.2f} | "
+                f"Grad Scale {grad_scale:.1f} | "
+                f"Batch Size {batch_size}"
             )
 
+            # Use both logging and print for rank 0 to ensure output
+            if rank == 0:
+                print(log_msg, flush=True)
+            logging.info(log_msg)
+            sys.stdout.flush()  # Force flush for immediate output
+
+            # TensorBoard logging (rank 0 only)
             if tb_writer is not None and rank == 0:
-                tot_loss.write_summary(tb_writer, "train/", params.batch_idx_train)
-                tb_writer.add_scalar("train/batch_size", batch_size, params.batch_idx_train)
-                # Reset metrics
+                step = params.batch_idx_train
+                tb_writer.add_scalar("train/learning_rate", cur_lr, step)
+                tb_writer.add_scalar("train/current_loss", current_loss, step)
+                tb_writer.add_scalar("train/running_loss", tot_loss.norm("loss"), step)
+                tb_writer.add_scalar("train/grad_norm", grad_norm, step)
+                tb_writer.add_scalar("train/grad_scale", grad_scale, step)
+                tb_writer.add_scalar("train/batch_size", batch_size, step)
+                tb_writer.flush()  # Force flush TensorBoard
+
+                # Reset metrics after writing
                 tot_loss = MetricsTracker()
 
 
@@ -553,19 +625,45 @@ def run(rank, world_size, args):
     params = get_params()
     params.update(vars(args))
 
-    # Setup logging
+    # Setup logging directory
     params.exp_dir = Path(params.exp_dir)
     params.exp_dir.mkdir(parents=True, exist_ok=True)
 
+    # CRITICAL: Set unbuffered output BEFORE any logging
+    import sys
+    import os
+
+    # Force unbuffered output for Python
+    sys.stdout = os.fdopen(sys.stdout.fileno(), 'w', buffering=1)
+    sys.stderr = os.fdopen(sys.stderr.fileno(), 'w', buffering=1)
+
+    # Also set environment variable
+    os.environ['PYTHONUNBUFFERED'] = '1'
+
+    # Setup logger with explicit console handler
     setup_logger(
         f"{params.exp_dir}/log-train-{rank}",
         log_level="INFO",
-        use_console=True
+        use_console=(rank == 0)  # Only rank 0 prints to console
     )
+
+    # Test logging immediately - should appear on console for rank 0
+    if rank == 0:
+        print("=" * 80, flush=True)
+        print(f"[INIT] Rank {rank}/{world_size} initialized successfully", flush=True)
+        print(f"[INIT] Experiment directory: {params.exp_dir}", flush=True)
+        print("=" * 80, flush=True)
+
+    logging.info("=" * 80)
+    logging.info(f"Rank {rank}/{world_size} initialized successfully")
+    logging.info(f"Experiment directory: {params.exp_dir}")
+    logging.info("=" * 80)
+    sys.stdout.flush()
 
     logging.info("Training parameters:")
     logging.info(params)
     logging.info(f"World size: {world_size}, Rank: {rank}")
+    sys.stdout.flush()
 
     # Set random seed
     fix_random_seed(params.seed + rank)
@@ -587,22 +685,41 @@ def run(rank, world_size, args):
     else:
         raise ValueError("This script requires DeepSpeed. Please use --deepspeed flag.")
 
+    # Load checkpoint if resuming training
+    if params.start_epoch > 1:
+        checkpoint_path = f"{params.exp_dir}/epoch-{params.start_epoch - 1}.pt"
+        if os.path.exists(checkpoint_path):
+            logging.info(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            model.load_state_dict(checkpoint["model"], strict=False)
+            params.batch_idx_train = checkpoint.get("batch_idx_train", 0)
+            logging.info(f"Resumed training from epoch {params.start_epoch}")
+            sys.stdout.flush()
+        else:
+            logging.warning(f"Checkpoint {checkpoint_path} not found, starting from epoch {params.start_epoch}")
+            sys.stdout.flush()
+
     # Setup data
     logging.info("Loading datasets")
     multi_dataset = MultiDataset(fbank_dir=str(params.manifest_dir))
 
-    # Choose dataset:
-    # Option 1: Test dataset (synthetic, for quick code testing)
-    cuts_train = multi_dataset.test_dataset_train_cuts()
-    cuts_valid = multi_dataset.test_dataset_dev_cuts()
+    # Choose dataset based on parameters
+    if params.use_test_dataset or params.dataset == "test":
+        logging.info("Using synthetic test dataset")
+        cuts_train = multi_dataset.test_dataset_train_cuts()
+        cuts_valid = multi_dataset.test_dataset_dev_cuts()
+    elif params.dataset == "aishell":
+        logging.info("Using AISHELL-1 dataset")
+        cuts_train = multi_dataset.aishell_train_cuts()
+        cuts_valid = multi_dataset.aishell_dev_cuts()
+    elif params.dataset == "all":
+        logging.info("Using all Chinese ASR datasets")
+        cuts_train = multi_dataset.train_cuts()
+        cuts_valid = multi_dataset.dev_cuts()
+    else:
+        raise ValueError(f"Unknown dataset: {params.dataset}")
 
-    # Option 2: AISHELL-1 (single dataset, recommended for initial experiments)
-    # cuts_train = multi_dataset.aishell_train_cuts()
-    # cuts_valid = multi_dataset.aishell_dev_cuts()
-
-    # Option 3: Full multi-dataset (all Chinese ASR datasets)
-    # cuts_train = multi_dataset.train_cuts()
-    # cuts_valid = multi_dataset.dev_cuts()
+    sys.stdout.flush()
 
     # Create data loaders
     asr_datamodule = AsrDataModule(args)
@@ -619,6 +736,12 @@ def run(rank, world_size, args):
         params.cur_epoch = epoch
         fix_random_seed(params.seed + epoch)
         train_dl.sampler.set_epoch(epoch)
+
+        # Print to ensure output visibility
+        if rank == 0:
+            print(f"\n{'='*80}", flush=True)
+            print(f"[EPOCH] Starting epoch {epoch}/{params.num_epochs}", flush=True)
+            print(f"{'='*80}\n", flush=True)
 
         logging.info(f"Starting epoch {epoch}")
 
