@@ -1,0 +1,658 @@
+#!/usr/bin/env python3
+# Training script for FireRedASR-LLM
+# Adapted from icefall whisper_llm_zh/train.py
+#
+# Usage:
+# Stage 1 (train projector only):
+# torchrun --nproc_per_node 8 training/fireredasr_llm/train.py \
+#   --training-stage 1 \
+#   --encoder-path pretrained_models/FireRedASR-AED-L/model.pth.tar \
+#   --llm-dir pretrained_models/Qwen2-7B-Instruct \
+#   --manifest-dir data/fbank \
+#   --exp-dir exp/fireredasr_llm_stage1 \
+#   --deepspeed \
+#   --deepspeed_config training/fireredasr_llm/ds_config_stage1.json
+#
+# Stage 2 (train projector + LoRA):
+# torchrun --nproc_per_node 8 training/fireredasr_llm/train.py \
+#   --training-stage 2 \
+#   --encoder-path pretrained_models/FireRedASR-AED-L/model.pth.tar \
+#   --llm-dir pretrained_models/Qwen2-7B-Instruct \
+#   --stage1-checkpoint exp/fireredasr_llm_stage1/epoch-5.pt \
+#   --manifest-dir data/fbank \
+#   --exp-dir exp/fireredasr_llm_stage2 \
+#   --deepspeed \
+#   --deepspeed_config training/fireredasr_llm/ds_config_stage2.json
+
+import argparse
+import copy
+import logging
+import os
+from pathlib import Path
+from typing import Dict, Optional, Tuple
+
+import deepspeed
+import torch
+import torch.nn as nn
+import transformers
+from asr_datamodule import AsrDataModule
+from deepspeed.utils.zero_to_fp32 import convert_zero_checkpoint_to_fp32_state_dict
+from lhotse.utils import fix_random_seed
+from multi_dataset import MultiDataset
+from torch import Tensor
+from torch.utils.tensorboard import SummaryWriter
+
+# Import from FireRedASR
+import sys
+sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+from fireredasr.models.fireredasr_llm import FireRedAsrLlm
+from fireredasr.tokenizer.llm_tokenizer import (
+    LlmTokenizerWrapper,
+    DEFAULT_SPEECH_TOKEN,
+    IGNORE_TOKEN_ID
+)
+
+# Import training utilities
+sys.path.insert(0, str(Path(__file__).parent.parent))
+from utils.dist import get_rank, get_world_size
+from utils.utils import AttributeDict, MetricsTracker, setup_logger, str2bool
+
+
+def add_model_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--training-stage",
+        type=int,
+        required=True,
+        choices=[1, 2],
+        help="Training stage: 1=projector only, 2=projector+LoRA",
+    )
+    parser.add_argument(
+        "--encoder-path",
+        type=str,
+        required=True,
+        help="Path to FireRedASR-AED checkpoint (model.pth.tar)",
+    )
+    parser.add_argument(
+        "--llm-dir",
+        type=str,
+        required=True,
+        help="Path to Qwen2 model directory",
+    )
+    parser.add_argument(
+        "--stage1-checkpoint",
+        type=str,
+        default="",
+        help="Path to Stage 1 checkpoint (for Stage 2 training)",
+    )
+    parser.add_argument(
+        "--use-fp16",
+        type=str2bool,
+        default=True,
+        help="Use FP16 mixed precision training",
+    )
+    parser.add_argument(
+        "--use-flash-attn",
+        type=str2bool,
+        default=True,
+        help="Use Flash Attention 2",
+    )
+
+
+def add_training_arguments(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "--exp-dir",
+        type=Path,
+        default=Path("exp/fireredasr_llm"),
+        help="Directory to save checkpoints and logs",
+    )
+    parser.add_argument(
+        "--start-epoch",
+        type=int,
+        default=1,
+        help="Resume training from this epoch",
+    )
+    parser.add_argument(
+        "--num-epochs",
+        type=int,
+        default=5,
+        help="Number of training epochs",
+    )
+    parser.add_argument(
+        "--valid-interval",
+        type=int,
+        default=5000,
+        help="Run validation every N batches",
+    )
+    parser.add_argument(
+        "--log-interval",
+        type=int,
+        default=50,
+        help="Log metrics every N batches",
+    )
+    parser.add_argument(
+        "--tensorboard",
+        type=str2bool,
+        default=True,
+        help="Use tensorboard for logging",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=42,
+        help="Random seed",
+    )
+    # DeepSpeed arguments
+    parser.add_argument(
+        "--deepspeed",
+        action="store_true",
+        help="Use DeepSpeed for training",
+    )
+    parser.add_argument(
+        "--deepspeed_config",
+        type=str,
+        default="",
+        help="Path to DeepSpeed config JSON",
+    )
+    parser.add_argument(
+        "--local_rank",
+        type=int,
+        default=-1,
+        help="Local rank for distributed training",
+    )
+
+
+def get_parser():
+    parser = argparse.ArgumentParser(
+        description="Train FireRedASR-LLM",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+
+    add_model_arguments(parser)
+    add_training_arguments(parser)
+    AsrDataModule.add_arguments(parser)
+
+    return parser
+
+
+def get_params() -> AttributeDict:
+    """Return training parameters"""
+    params = AttributeDict(
+        {
+            "best_train_loss": float("inf"),
+            "best_valid_loss": float("inf"),
+            "best_train_epoch": -1,
+            "best_valid_epoch": -1,
+            "batch_idx_train": 0,
+            "cur_epoch": 1,
+        }
+    )
+    return params
+
+
+def build_model(params: AttributeDict) -> FireRedAsrLlm:
+    """
+    Build FireRedASR-LLM model based on training stage.
+
+    Stage 1: freeze_encoder=True, freeze_llm=True, use_lora=False
+    Stage 2: freeze_encoder=True, freeze_llm=False, use_lora=True
+    """
+    logging.info(f"Building model for Stage {params.training_stage}")
+
+    # Create model arguments
+    args = argparse.Namespace()
+    args.encoder_path = params.encoder_path
+    args.llm_dir = params.llm_dir
+    args.freeze_encoder = True  # Always freeze encoder
+    args.use_fp16 = params.use_fp16
+    args.use_flash_attn = params.use_flash_attn
+    args.encoder_downsample_rate = 2  # FireRedASR uses 2x
+
+    if params.training_stage == 1:
+        # Stage 1: Train projector only
+        args.freeze_llm = True
+        args.use_lora = False
+        logging.info("Stage 1: Training projector only (encoder and LLM frozen)")
+    else:
+        # Stage 2: Train projector + LoRA
+        args.freeze_llm = False
+        args.use_lora = True
+        logging.info("Stage 2: Training projector + LoRA (encoder frozen)")
+
+    # Build model
+    model = FireRedAsrLlm.from_args(args)
+
+    # Load Stage 1 checkpoint for Stage 2
+    if params.training_stage == 2 and params.stage1_checkpoint:
+        logging.info(f"Loading Stage 1 checkpoint: {params.stage1_checkpoint}")
+        checkpoint = torch.load(params.stage1_checkpoint, map_location="cpu", weights_only=False)
+        missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
+        logging.info(f"Missing keys: {missing_keys}")
+        logging.info(f"Unexpected keys: {unexpected_keys}")
+
+    # Log trainable parameters
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in model.parameters())
+    logging.info(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
+                 f"({100 * trainable_params / total_params:.2f}%)")
+
+    return model
+
+
+def preprocess_texts(
+    messages,
+    tokenizer: transformers.PreTrainedTokenizer,
+    max_len: int = 128,
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """
+    Preprocess text messages for training.
+
+    Returns:
+        input_ids: (batch_size, seq_len)
+        attention_mask: (batch_size, seq_len)
+        target_ids: (batch_size, seq_len) with prompts masked using IGNORE_TOKEN_ID
+    """
+    texts = []
+    TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content']}}{% if loop.last %}{{ '<|im_end|>'}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
+
+    for i, msg in enumerate(messages):
+        texts.append(
+            tokenizer.apply_chat_template(
+                msg,
+                tokenize=True,
+                chat_template=TEMPLATE,
+                add_generation_prompt=False,
+                padding="longest",
+                max_length=max_len,
+                truncation=True,
+            )
+        )
+
+    # Pad texts to same length
+    max_len_texts = max([len(text) for text in texts])
+    if tokenizer.padding_side == "right":
+        texts = [
+            text + [tokenizer.pad_token_id] * (max_len_texts - len(text))
+            for text in texts
+        ]
+    else:
+        texts = [
+            [tokenizer.pad_token_id] * (max_len_texts - len(text)) + text
+            for text in texts
+        ]
+
+    input_ids = torch.tensor(texts, dtype=torch.long)
+    target_ids = input_ids.clone()
+
+    # Mask padding tokens
+    target_ids[target_ids == tokenizer.pad_token_id] = IGNORE_TOKEN_ID
+
+    # Mask prompt tokens (before "assistant")
+    mask_indices = torch.where(
+        input_ids == tokenizer.convert_tokens_to_ids("assistant")
+    )
+    for i in range(mask_indices[0].size(0)):
+        row = mask_indices[0][i]
+        col = mask_indices[1][i]
+        # +2 to skip 'assistant' and '\n'
+        target_ids[row, : col + 2] = IGNORE_TOKEN_ID
+
+    attention_mask = input_ids.ne(tokenizer.pad_token_id)
+
+    return input_ids, attention_mask, target_ids
+
+
+def compute_loss(
+    params: AttributeDict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: nn.Module,
+    batch: dict,
+    is_training: bool,
+) -> Tuple[Tensor, MetricsTracker]:
+    """
+    Compute loss for a batch.
+
+    Args:
+        params: Training parameters
+        tokenizer: Tokenizer
+        model: Model
+        batch: Batch from DataLoader
+        is_training: Whether in training mode
+
+    Returns:
+        loss: Scalar loss
+        info: MetricsTracker with loss info
+    """
+    device = next(model.parameters()).device
+
+    # Get features (N, T, F)
+    feature = batch["inputs"]
+    assert feature.ndim == 3
+    feature = feature.to(device)
+
+    # Get text supervisions
+    texts = batch["supervisions"]["text"]
+    feature_lengths = batch["supervisions"]["num_frames"].to(device)
+
+    # Prepare messages in chat format
+    messages = []
+    for text in texts:
+        text = text.replace(" ", "")  # Remove spaces for Chinese
+        message = [
+            {"role": "user", "content": f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"},
+            {"role": "assistant", "content": text},
+        ]
+        messages.append(message)
+
+    # Tokenize
+    input_ids, attention_mask, target_ids = preprocess_texts(
+        messages, tokenizer, max_len=128
+    )
+    input_ids = input_ids.to(device)
+    attention_mask = attention_mask.to(device)
+    target_ids = target_ids.to(device)
+
+    # Forward pass through encoder
+    encoder_outs, enc_lengths, enc_mask = model.encoder(feature, feature_lengths)
+
+    # Forward through projector
+    speech_features, speech_lens = model.encoder_projector(encoder_outs, enc_lengths)
+
+    # Get text embeddings
+    inputs_embeds = model.llm.get_input_embeddings()(input_ids)
+
+    # Merge speech and text embeddings
+    inputs_embeds, attention_mask, target_ids = model._merge_input_ids_with_speech_features(
+        speech_features.to(inputs_embeds.dtype),
+        inputs_embeds,
+        input_ids,
+        attention_mask,
+        target_ids,
+        speech_lens=speech_lens
+    )
+
+    # Forward through LLM
+    outputs = model.llm(
+        inputs_embeds=inputs_embeds,
+        attention_mask=attention_mask,
+        labels=target_ids,
+        return_dict=True
+    )
+
+    loss = outputs.loss
+
+    # Track metrics
+    info = MetricsTracker()
+    info["loss"] = loss.detach().cpu()
+
+    return loss, info
+
+
+def compute_validation_loss(
+    params: AttributeDict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: nn.Module,
+    valid_dl: torch.utils.data.DataLoader,
+    world_size: int = 1,
+) -> MetricsTracker:
+    """Compute validation loss"""
+    model.eval()
+
+    tot_loss = MetricsTracker()
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(valid_dl):
+            loss, info = compute_loss(
+                params=params,
+                tokenizer=tokenizer,
+                model=model,
+                batch=batch,
+                is_training=False,
+            )
+
+            tot_loss["loss"] = info["loss"]
+
+            if batch_idx >= 10:  # Limit validation batches
+                break
+
+    return tot_loss
+
+
+def train_one_epoch(
+    params: AttributeDict,
+    tokenizer: transformers.PreTrainedTokenizer,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    train_dl: torch.utils.data.DataLoader,
+    valid_dl: torch.utils.data.DataLoader,
+    tb_writer: Optional[SummaryWriter] = None,
+    world_size: int = 1,
+    rank: int = 0,
+) -> None:
+    """Train for one epoch"""
+
+    # Set training mode
+    model.train()
+    model.encoder.eval()  # Encoder always in eval mode
+    if params.training_stage == 1:
+        model.llm.eval()  # LLM also in eval for Stage 1
+
+    tot_loss = MetricsTracker()
+
+    for batch_idx, batch in enumerate(train_dl):
+        params.batch_idx_train += 1
+        batch_size = len(batch["supervisions"]["text"])
+
+        # Periodic validation
+        if batch_idx % params.valid_interval == 0 and batch_idx > 0:
+            logging.info("Running validation")
+            valid_info = compute_validation_loss(
+                params=params,
+                tokenizer=tokenizer,
+                model=model,
+                valid_dl=valid_dl,
+                world_size=world_size,
+            )
+
+            # Back to training mode
+            model.train()
+            model.encoder.eval()
+            if params.training_stage == 1:
+                model.llm.eval()
+
+            logging.info(f"Epoch {params.cur_epoch}, validation loss: {valid_info.norm('loss'):.4f}")
+
+            if tb_writer is not None and rank == 0:
+                valid_info.write_summary(tb_writer, "train/valid_", params.batch_idx_train)
+
+            # Save checkpoint
+            if rank == 0:
+                save_checkpoint(params, model, optimizer, scheduler, train_dl.sampler)
+
+        # Forward pass
+        loss, info = compute_loss(
+            params=params,
+            tokenizer=tokenizer,
+            model=model,
+            batch=batch,
+            is_training=True,
+        )
+
+        # Backward pass (DeepSpeed handles this)
+        model.backward(loss)
+        model.step()
+
+        tot_loss["loss"] = info["loss"]
+
+        # Logging
+        if batch_idx % params.log_interval == 0:
+            logging.info(
+                f"Epoch {params.cur_epoch}, batch {batch_idx}, "
+                f"loss: {tot_loss.norm('loss'):.4f}, "
+                f"batch_size: {batch_size}"
+            )
+
+            if tb_writer is not None and rank == 0:
+                tot_loss.write_summary(tb_writer, "train/", params.batch_idx_train)
+                tb_writer.add_scalar("train/batch_size", batch_size, params.batch_idx_train)
+                # Reset metrics
+                tot_loss = MetricsTracker()
+
+
+def save_checkpoint(
+    params: AttributeDict,
+    model: nn.Module,
+    optimizer: Optional[torch.optim.Optimizer],
+    scheduler: Optional[torch.optim.lr_scheduler._LRScheduler],
+    sampler,
+) -> None:
+    """Save checkpoint"""
+    save_dir = Path(params.exp_dir)
+    save_dir.mkdir(parents=True, exist_ok=True)
+
+    tag = f"epoch-{params.cur_epoch}"
+
+    # Save DeepSpeed checkpoint
+    logging.info(f"Saving checkpoint to {save_dir}/{tag}")
+    model.save_checkpoint(
+        save_dir=str(save_dir),
+        tag=tag,
+        client_state={},
+        exclude_frozen_parameters=True,
+    )
+
+    # Convert to FP32 state dict for easy loading
+    logging.info("Converting checkpoint to FP32")
+    convert_zero_checkpoint_to_fp32_state_dict(
+        str(save_dir),
+        f"{save_dir}/{tag}.pt",
+        tag=tag,
+        exclude_frozen_parameters=True,
+    )
+
+    # Save sampler state
+    sampler_state_dict = sampler.state_dict()
+    torch.save(sampler_state_dict, f"{save_dir}/{tag}-sampler.pt")
+
+    logging.info(f"Checkpoint saved: {save_dir}/{tag}.pt")
+
+
+def load_checkpoint(
+    filename: Path,
+    model: nn.Module,
+) -> None:
+    """Load checkpoint"""
+    logging.info(f"Loading checkpoint from {filename}")
+    checkpoint = torch.load(filename, map_location="cpu")
+    model.load_state_dict(checkpoint, strict=False)
+    logging.info("Checkpoint loaded successfully")
+
+
+def run(rank, world_size, args):
+    """Main training function"""
+    params = get_params()
+    params.update(vars(args))
+
+    # Setup logging
+    params.exp_dir = Path(params.exp_dir)
+    params.exp_dir.mkdir(parents=True, exist_ok=True)
+
+    setup_logger(
+        f"{params.exp_dir}/log-train-{rank}",
+        log_level="INFO",
+        use_console=True
+    )
+
+    logging.info("Training parameters:")
+    logging.info(params)
+    logging.info(f"World size: {world_size}, Rank: {rank}")
+
+    # Set random seed
+    fix_random_seed(params.seed + rank)
+
+    # Build model
+    model = build_model(params)
+
+    # Get tokenizer
+    tokenizer = LlmTokenizerWrapper.build_llm_tokenizer(params.llm_dir)
+
+    # Initialize DeepSpeed
+    if params.deepspeed:
+        logging.info("Initializing DeepSpeed")
+        model, optimizer, _, scheduler = deepspeed.initialize(
+            args=args,
+            model=model,
+            model_parameters=model.parameters()
+        )
+    else:
+        raise ValueError("This script requires DeepSpeed. Please use --deepspeed flag.")
+
+    # Setup data
+    logging.info("Loading datasets")
+    multi_dataset = MultiDataset(fbank_dir=str(params.manifest_dir))
+
+    # Choose dataset:
+    # Option 1: Test dataset (synthetic, for quick code testing)
+    cuts_train = multi_dataset.test_dataset_train_cuts()
+    cuts_valid = multi_dataset.test_dataset_dev_cuts()
+
+    # Option 2: AISHELL-1 (single dataset, recommended for initial experiments)
+    # cuts_train = multi_dataset.aishell_train_cuts()
+    # cuts_valid = multi_dataset.aishell_dev_cuts()
+
+    # Option 3: Full multi-dataset (all Chinese ASR datasets)
+    # cuts_train = multi_dataset.train_cuts()
+    # cuts_valid = multi_dataset.dev_cuts()
+
+    # Create data loaders
+    asr_datamodule = AsrDataModule(args)
+    train_dl = asr_datamodule.train_dataloaders(cuts_train)
+    valid_dl = asr_datamodule.valid_dataloaders(cuts_valid)
+
+    # Tensorboard
+    tb_writer = None
+    if params.tensorboard and rank == 0:
+        tb_writer = SummaryWriter(log_dir=f"{params.exp_dir}/tensorboard")
+
+    # Training loop
+    for epoch in range(params.start_epoch, params.num_epochs + 1):
+        params.cur_epoch = epoch
+        fix_random_seed(params.seed + epoch)
+        train_dl.sampler.set_epoch(epoch)
+
+        logging.info(f"Starting epoch {epoch}")
+
+        train_one_epoch(
+            params=params,
+            tokenizer=tokenizer,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            train_dl=train_dl,
+            valid_dl=valid_dl,
+            tb_writer=tb_writer,
+            world_size=world_size,
+            rank=rank,
+        )
+
+        # Save checkpoint at end of epoch
+        if rank == 0:
+            save_checkpoint(params, model, optimizer, scheduler, train_dl.sampler)
+
+        logging.info(f"Epoch {epoch} completed")
+
+    logging.info("Training completed!")
+
+
+def main():
+    parser = get_parser()
+    args = parser.parse_args()
+
+    world_size = get_world_size()
+    rank = get_rank()
+
+    run(rank, world_size, args)
+
+
+if __name__ == "__main__":
+    main()
