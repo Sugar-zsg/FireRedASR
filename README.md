@@ -90,6 +90,23 @@ $ speech2text.py --wav_path examples/wav/BAC009S0764W0121.wav --asr_type "aed" -
 $ speech2text.py --wav_path examples/wav/BAC009S0764W0121.wav --asr_type "llm" --model_dir pretrained_models/FireRedASR-LLM-L
 ```
 
+### Package for Transformers
+To run in a clean environment via `transformers` only, package artifacts:
+```bash
+python tools/export_to_hf.py \
+  --src_dir pretrained_models/FireRedTeam-FireRedASR-AED-L \
+  --dst_dir out/fire-red-asr-aed-hf \
+  --asr_type aed
+```
+Then load elsewhere:
+```python
+from transformers import AutoModel
+from fireredasr.hf import FireRedASRConfig
+model = AutoModel.from_pretrained('out/fire-red-asr-aed-hf', config=FireRedASRConfig(asr_type='aed'))
+out = model.generate(wav_paths=['examples/wav/BAC009S0764W0121.wav'])
+print(out.sequences)
+```
+
 ### Python Usage
 ```python
 from fireredasr.models.fireredasr import FireRedAsr
