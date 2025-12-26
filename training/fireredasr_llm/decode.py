@@ -126,13 +126,33 @@ def load_model(args):
     """Load trained model from checkpoint"""
     logging.info(f"Loading model from {args.checkpoint}")
 
-    # Build model
+    # Load checkpoint first to inspect keys
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+
+    # Determine if this is Stage 1 (adapter only) or Stage 2 (adapter + LoRA)
+    # Stage 1 checkpoint has only adapter keys (encoder_projector)
+    # Stage 2 checkpoint has adapter + llm.base_model.* (LoRA) keys
+    checkpoint_keys = checkpoint.keys()
+    has_lora_keys = any(k.startswith('llm.base_model') for k in checkpoint_keys)
+    has_adapter_only = any(k.startswith('encoder_projector') for k in checkpoint_keys) and not has_lora_keys
+
+    if has_lora_keys:
+        logging.info("Detected Stage 2 checkpoint (adapter + LoRA)")
+        use_lora = True
+    elif has_adapter_only:
+        logging.info("Detected Stage 1 checkpoint (adapter only)")
+        use_lora = True  # Still need LoRA structure to load LLM properly
+    else:
+        logging.info("Unknown checkpoint type, assuming Stage 2")
+        use_lora = True
+
+    # Build model with correct configuration
     model_args = argparse.Namespace(
         encoder_path=args.encoder_path,
         llm_dir=args.llm_dir,
         freeze_encoder=True,
-        freeze_llm=False,
-        use_lora=True,  # Assume Stage 2 checkpoint
+        freeze_llm=False,  # Must be False to apply LoRA wrapper
+        use_lora=use_lora,
         use_fp16=False,  # Use FP32 for inference
         use_flash_attn=False,
         encoder_downsample_rate=2
@@ -140,9 +160,14 @@ def load_model(args):
     model = FireRedAsrLlm.from_args(model_args)
 
     # Load checkpoint
-    checkpoint = torch.load(args.checkpoint, map_location="cpu")
     missing, unexpected = model.load_state_dict(checkpoint, strict=False)
     logging.info(f"Checkpoint loaded. Missing keys: {len(missing)}, Unexpected keys: {len(unexpected)}")
+
+    # Log key info for debugging
+    if len(missing) > 0:
+        logging.info(f"Missing keys (first 5): {list(missing)[:5]}")
+    if len(unexpected) > 0:
+        logging.info(f"Unexpected keys (first 5): {list(unexpected)[:5]}")
 
     model.eval()
 
@@ -201,8 +226,15 @@ def decode_batch(model, tokenizer, batch, args):
     feature_lengths = batch["supervisions"]["num_frames"].to(device)
 
     # Get utterance IDs
-    uttids = batch["supervisions"]["cut"].ids if "cut" in batch["supervisions"] else \
-             [f"utt_{i}" for i in range(len(batch["supervisions"]["text"]))]
+    if "cut" in batch["supervisions"] and hasattr(batch["supervisions"]["cut"], "ids"):
+        uttids = batch["supervisions"]["cut"].ids
+    else:
+        # Extract IDs from cut objects if available
+        cuts = batch.get("supervisions", {}).get("cut", [])
+        if cuts and hasattr(cuts[0], "id"):
+            uttids = [cut.id for cut in cuts]
+        else:
+            uttids = [f"utt_{i}" for i in range(len(batch["supervisions"]["text"]))]
 
     # Encode features
     encoder_outs, enc_lengths, enc_mask = model.encoder(features, feature_lengths)

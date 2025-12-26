@@ -212,31 +212,119 @@ torchrun --nproc_per_node 8 training/fireredasr_llm/train.py \
   --deepspeed_config training/fireredasr_llm/ds_config_stage1.json
 ```
 
-## 评估（待实现）
+## 评估与测试
+
+### 快速测试
+
+使用测试脚本快速验证训练效果：
 
 ```bash
-# 使用decode.py评估模型
+# 使用提供的测试脚本（测试合成数据集）
+bash test_decode.sh
+
+# 或手动运行decode.py
 python training/fireredasr_llm/decode.py \
-  --checkpoint exp/fireredasr_llm_stage2/epoch-3.pt \
+  --checkpoint exp/test_stage2/epoch-1.pt/pytorch_model.bin \
+  --encoder-path pretrained_models/FireRedASR-LLM-L/asr_encoder.pth.tar \
+  --llm-dir pretrained_models/Qwen2-7B-Instruct \
   --manifest-dir data/fbank \
-  --test-set aishell_test
+  --test-manifest test_dataset/test_cuts_test.jsonl.gz \
+  --output-dir results/test_stage2 \
+  --beam-size 3 \
+  --repetition-penalty 3.0 \
+  --use-gpu 1
 ```
 
-## Checkpoint管理
+### 在AISHELL-1测试集上评估
+
+```bash
+python training/fireredasr_llm/decode.py \
+  --checkpoint exp/fireredasr_llm_stage2/epoch-3.pt/pytorch_model.bin \
+  --encoder-path pretrained_models/FireRedASR-AED-L/model.pth.tar \
+  --llm-dir pretrained_models/Qwen2-7B-Instruct \
+  --manifest-dir data/fbank \
+  --test-manifest aishell_cuts_test.jsonl.gz \
+  --output-dir results/aishell_test \
+  --beam-size 3 \
+  --repetition-penalty 3.0 \
+  --llm-length-penalty 1.0 \
+  --temperature 1.0 \
+  --max-duration 100.0 \
+  --use-gpu 1
+```
+
+### 解码参数调整
+
+不同场景下可以调整以下参数：
+
+| 参数 | 默认值 | 说明 | 建议 |
+|------|--------|------|------|
+| `--beam-size` | 3 | Beam search大小 | 1(greedy/快速), 3(平衡), 5-10(高质量) |
+| `--repetition-penalty` | 3.0 | 重复惩罚 | 1.0(无), 3.0(推荐), 5.0(强惩罚) |
+| `--llm-length-penalty` | 1.0 | 长度惩罚 | <1.0(短句), 1.0(中性), >1.0(长句) |
+| `--temperature` | 1.0 | 采样温度 | 仅在sampling时有效 |
+| `--max-duration` | 100.0 | 批次大小(秒) | 根据显存调整 |
+
+### 查看评估结果
+
+```bash
+# 查看CER和详细结果
+cat results/aishell_test/aishell_cuts_test.jsonl_results.txt
+
+# 预期结果（完整训练后）
+# CER: < 10% (良好)
+# CER: < 5%  (优秀)
+# CER: < 2%  (接近完美)
+```
+
+**详细测试文档**: 参见项目根目录的 `TESTING_GUIDE.md`
+
+## Checkpoint管理与模型打包
 
 ### Checkpoint文件结构
 
+训练过程会自动生成以下文件：
+
 ```
-exp/fireredasr_llm_stage1/
-├── epoch-1.pt              # FP32 state dict（可直接加载）
-├── epoch-1-sampler.pt      # 采样器状态
-├── epoch-1/                # DeepSpeed checkpoint（分布式训练用）
-│   ├── zero_pp_rank_0_mp_rank_00_model_states.pt
-│   └── ...
-└── tensorboard/            # TensorBoard日志
+exp/fireredasr_llm_stage2/
+├── epoch-1.pt/                         # FP32 checkpoint（推荐使用）
+│   └── pytorch_model.bin               # 完整模型权重 (749 MB)
+├── epoch-1-sampler.pt                  # 采样器状态
+├── epoch-1/                            # DeepSpeed原始checkpoint (可删除)
+│   ├── mp_rank_00_model_states.pt      # 模型状态 (750 MB)
+│   └── zero_pp_rank_0_mp_rank_00_optim_states.pt  # 优化器状态 (2.1 GB)
+├── latest                              # 指向最新checkpoint
+└── tensorboard/                        # TensorBoard日志
+```
+
+**推荐保留**:
+- ✅ `epoch-N.pt/pytorch_model.bin` - 用于推理和部署
+- ✅ `tensorboard/` - 训练曲线可视化
+- ❌ `epoch-N/` - 原始DeepSpeed checkpoint（已转换，可删除节省空间）
+
+### 提取LoRA权重（可选）
+
+如果需要单独管理LoRA权重或使用HuggingFace PEFT格式：
+
+```bash
+python training/fireredasr_llm/extract_lora.py \
+  --checkpoint exp/fireredasr_llm_stage2/epoch-3.pt/pytorch_model.bin \
+  --output-dir exp/fireredasr_llm_stage2/lora_weights
+```
+
+生成的文件：
+```
+lora_weights/
+├── lora_weights.pt            # 仅LoRA参数 (616 MB)
+├── adapter_weights.pt         # 仅Adapter参数 (84 MB)
+├── combined_weights.pt        # LoRA + Adapter (700 MB)
+├── adapter_config.json        # HuggingFace PEFT配置
+└── params_list.json           # 参数名称列表
 ```
 
 ### 加载Checkpoint进行推理
+
+#### 方法1: 直接加载完整checkpoint
 
 ```python
 from fireredasr.models.fireredasr_llm import FireRedAsrLlm
@@ -255,12 +343,252 @@ args = argparse.Namespace(
 )
 model = FireRedAsrLlm.from_args(args)
 
-# 加载训练好的weights
-checkpoint = torch.load("exp/fireredasr_llm_stage2/epoch-3.pt")
+# 加载训练好的权重
+checkpoint = torch.load(
+    "exp/fireredasr_llm_stage2/epoch-3.pt/pytorch_model.bin",
+    map_location="cpu",
+    weights_only=False
+)
 model.load_state_dict(checkpoint, strict=False)
 model.eval()
 
-# 使用model.transcribe()进行推理
+# 推理
+results = model.transcribe(
+    audio_path="test.wav",
+    beam_size=3,
+    repetition_penalty=3.0
+)
+print(results)
+```
+
+#### 方法2: 使用HuggingFace PEFT加载LoRA
+
+```python
+from transformers import AutoModelForCausalLM
+from peft import PeftModel
+
+# 加载base model
+base_model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen2-7B-Instruct")
+
+# 加载LoRA adapter
+model = PeftModel.from_pretrained(
+    base_model,
+    "exp/fireredasr_llm_stage2/lora_weights",
+    is_trainable=False
+)
+model.eval()
+
+# 注意：这种方法只加载LLM的LoRA，不包括Encoder和Adapter
+# 需要配合FireRedASR的encoder使用
+```
+
+## 模型打包与部署
+
+### 1. 打包为可发布的模型
+
+创建一个完整的模型目录，包含所有必要文件：
+
+```bash
+# 创建模型目录
+mkdir -p my_fireredasr_llm_model
+
+# 复制必要文件
+cp -r pretrained_models/FireRedASR-LLM-L/* my_fireredasr_llm_model/
+
+# 替换训练的模型权重
+cp exp/fireredasr_llm_stage2/epoch-3.pt/pytorch_model.bin \
+   my_fireredasr_llm_model/model.pth.tar
+
+# 打包
+tar -czf my_fireredasr_llm_model.tar.gz my_fireredasr_llm_model/
+```
+
+生成的目录结构：
+```
+my_fireredasr_llm_model/
+├── model.pth.tar              # 训练的模型权重 (749 MB)
+├── asr_encoder.pth.tar        # ASR encoder权重 (2.7 GB)
+├── cmvn.ark                   # CMVN统计量
+├── Qwen2-7B-Instruct/         # Qwen2 base model (软链接或拷贝)
+│   ├── config.json
+│   ├── model-00001-of-00004.safetensors
+│   ├── ...
+│   └── tokenizer.json
+└── README.md                  # 模型说明文档
+```
+
+### 2. 创建模型说明文档
+
+为打包的模型创建README：
+
+```bash
+cat > my_fireredasr_llm_model/README.md << 'EOF'
+# Custom FireRedASR-LLM Model
+
+## 模型信息
+
+- **训练数据**: AISHELL-1 (178小时中文语音)
+- **训练轮数**: Stage 1 (5 epochs) + Stage 2 (3 epochs)
+- **架构**: Conformer Encoder + Adapter + Qwen2-7B-Instruct (LoRA)
+- **性能**: CER ~X.X% on AISHELL-1 test set
+
+## 使用方法
+
+### 安装依赖
+```bash
+pip install torch transformers peft kaldi_native_fbank sentencepiece
+```
+
+### 推理示例
+```python
+from fireredasr.models.fireredasr import FireRedAsr
+
+# 加载模型
+model = FireRedAsr.from_pretrained(
+    model_dir="my_fireredasr_llm_model",
+    asr_type="llm"
+)
+
+# 识别音频
+result = model.transcribe(
+    audio_path="test.wav",
+    beam_size=3,
+    repetition_penalty=3.0
+)
+print(result)
+```
+
+## 训练信息
+
+- 训练时间: ~XX小时 on 8x V100
+- 最终训练loss: X.XXX
+- 最终验证loss: X.XXX
+- 训练日期: YYYY-MM-DD
+
+## 许可证
+
+Apache License 2.0
+EOF
+```
+
+### 3. 模型版本管理
+
+建议使用语义化版本号管理模型：
+
+```bash
+# 版本号格式: v{major}.{minor}.{patch}
+# major: 架构变更
+# minor: 训练数据或超参数变更
+# patch: 小修复或微调
+
+# 示例
+my_fireredasr_llm_model_v1.0.0.tar.gz  # 初始版本
+my_fireredasr_llm_model_v1.1.0.tar.gz  # 添加更多训练数据
+my_fireredasr_llm_model_v1.1.1.tar.gz  # 修复解码bug
+```
+
+### 4. 上传到HuggingFace Hub（可选）
+
+将模型上传到HuggingFace以便分享：
+
+```python
+from huggingface_hub import HfApi
+
+api = HfApi()
+
+# 上传模型
+api.upload_folder(
+    folder_path="my_fireredasr_llm_model",
+    repo_id="your-username/fireredasr-llm-aishell",
+    repo_type="model",
+)
+```
+
+### 5. 模型量化（可选）
+
+减小模型大小以便部署：
+
+```python
+import torch
+from transformers import AutoModelForCausalLM
+
+# 加载模型
+model = AutoModelForCausalLM.from_pretrained(
+    "pretrained_models/Qwen2-7B-Instruct",
+    device_map="auto",
+    torch_dtype=torch.float16  # FP16量化
+)
+
+# 或使用4-bit量化（需要bitsandbytes）
+model = AutoModelForCausalLM.from_pretrained(
+    "pretrained_models/Qwen2-7B-Instruct",
+    device_map="auto",
+    load_in_4bit=True,  # 4-bit量化
+    bnb_4bit_compute_dtype=torch.float16
+)
+```
+
+### 6. 部署为API服务
+
+使用FastAPI创建REST API：
+
+```python
+# server.py
+from fastapi import FastAPI, File, UploadFile
+from fireredasr.models.fireredasr import FireRedAsr
+import tempfile
+
+app = FastAPI()
+model = FireRedAsr.from_pretrained("my_fireredasr_llm_model", asr_type="llm")
+
+@app.post("/transcribe")
+async def transcribe(audio: UploadFile = File(...)):
+    # 保存上传的音频
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
+        tmp.write(await audio.read())
+        tmp_path = tmp.name
+
+    # 识别
+    result = model.transcribe(tmp_path, beam_size=3)
+
+    return {"text": result}
+
+# 运行: uvicorn server:app --host 0.0.0.0 --port 8000
+```
+
+### 7. Docker部署（推荐）
+
+创建Dockerfile：
+
+```dockerfile
+FROM pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime
+
+WORKDIR /app
+
+# 安装依赖
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+# 复制模型和代码
+COPY my_fireredasr_llm_model/ /app/models/
+COPY fireredasr/ /app/fireredasr/
+COPY server.py /app/
+
+EXPOSE 8000
+
+CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "8000"]
+```
+
+构建和运行：
+```bash
+# 构建镜像
+docker build -t fireredasr-llm-api:v1.0.0 .
+
+# 运行容器
+docker run -d --gpus all -p 8000:8000 fireredasr-llm-api:v1.0.0
+
+# 测试API
+curl -X POST -F "audio=@test.wav" http://localhost:8000/transcribe
 ```
 
 ## 超参数建议
@@ -491,14 +819,32 @@ cuts_valid = multi_dataset.dev_cuts()
 
 ## 文件说明
 
-- `train.py`: 主训练脚本
-- `asr_datamodule.py`: Lhotse数据加载模块
-- `multi_dataset.py`: 多数据集管理
-- `ds_config_stage1.json`: Stage 1 DeepSpeed配置
-- `ds_config_stage2.json`: Stage 2 DeepSpeed配置
-- `decode.py`: 评估脚本（完整实现，支持beam search和CER计算）
-- `prepare_test_data.py`: 测试数据集生成脚本
-- `README.md`: 本文档
+### 核心训练文件
+
+- `train.py`: 主训练脚本，支持两阶段训练和分布式训练
+- `asr_datamodule.py`: Lhotse数据加载模块，支持动态bucketing
+- `multi_dataset.py`: 多数据集管理，支持AISHELL、WenetSpeech等
+- `ds_config_stage1.json`: Stage 1 DeepSpeed配置 (FP16, ZeRO-1)
+- `ds_config_stage2.json`: Stage 2 DeepSpeed配置 (FP16, ZeRO-1)
+- `ds_config_stage2_fp32.json`: Stage 2 FP32配置 (测试用)
+
+### 评估和工具
+
+- `decode.py`: 完整评估脚本，支持beam search、CER/WER计算
+- `extract_lora.py`: LoRA权重提取工具，生成HuggingFace PEFT格式
+- `prepare_test_data.py`: 合成测试数据集生成脚本
+
+### 测试脚本
+
+- `test_stage1_training.sh`: Stage 1快速测试脚本
+- `test_stage2_training.sh`: Stage 2快速测试脚本
+- `test_decode.sh`: 模型识别效果测试脚本
+
+### 文档
+
+- `README.md`: 本文档（训练、评估、部署完整指南）
+- `../../TESTING_GUIDE.md`: 详细测试指南
+- `../../ALL_STAGES_TEST_REPORT.md`: 完整测试报告
 
 ## License
 

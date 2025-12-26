@@ -349,3 +349,13 @@ class MultiDataset:
         """Load synthetic test dataset for quick testing"""
         logging.info("Loading synthetic test dataset (test)")
         return load_manifest_lazy(self.fbank_dir / "test_dataset" / "test_cuts_test.jsonl.gz")
+
+    def custom_train_cuts(self) -> CutSet:
+        """Load custom dataset from urls.txt + ref.txt (train)"""
+        logging.info("Loading custom dataset (train)")
+        return load_manifest_lazy(self.fbank_dir / "custom_dataset" / "custom_cuts_train.jsonl.gz")
+
+    def custom_dev_cuts(self) -> CutSet:
+        """Load custom dataset from urls.txt + ref.txt (dev)"""
+        logging.info("Loading custom dataset (dev)")
+        return load_manifest_lazy(self.fbank_dir / "custom_dataset" / "custom_cuts_dev.jsonl.gz")

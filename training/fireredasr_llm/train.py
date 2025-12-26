@@ -151,8 +151,8 @@ def add_training_arguments(parser: argparse.ArgumentParser):
         "--dataset",
         type=str,
         default="aishell",
-        choices=["aishell", "all", "test"],
-        help="Which real dataset to use: aishell (single), all (multi-dataset), or test (synthetic)",
+        choices=["aishell", "all", "test", "custom"],
+        help="Which real dataset to use: aishell (single), all (multi-dataset), test (synthetic), or custom (urls.txt + ref.txt)",
     )
     # DeepSpeed arguments
     parser.add_argument(
@@ -233,6 +233,12 @@ def build_model(params: AttributeDict) -> FireRedAsrLlm:
 
     # Build model
     model = FireRedAsrLlm.from_args(args)
+
+    # Convert encoder to FP32 if not using FP16
+    if not params.use_fp16:
+        logging.info("Converting encoder to FP32")
+        model.encoder = model.encoder.float()
+        logging.info("Encoder converted to FP32")
 
     # Load Stage 1 checkpoint for Stage 2
     if params.training_stage == 2 and params.stage1_checkpoint:
@@ -336,11 +342,12 @@ def compute_loss(
         info: MetricsTracker with loss info
     """
     device = next(model.parameters()).device
+    dtype = next(model.parameters()).dtype
 
     # Get features (N, T, F)
     feature = batch["inputs"]
     assert feature.ndim == 3
-    feature = feature.to(device)
+    feature = feature.to(device=device, dtype=dtype)
 
     # Get text supervisions
     texts = batch["supervisions"]["text"]
@@ -716,6 +723,10 @@ def run(rank, world_size, args):
         logging.info("Using all Chinese ASR datasets")
         cuts_train = multi_dataset.train_cuts()
         cuts_valid = multi_dataset.dev_cuts()
+    elif params.dataset == "custom":
+        logging.info("Using custom dataset (urls.txt + ref.txt)")
+        cuts_train = multi_dataset.custom_train_cuts()
+        cuts_valid = multi_dataset.custom_dev_cuts()
     else:
         raise ValueError(f"Unknown dataset: {params.dataset}")
 
