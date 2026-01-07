@@ -96,6 +96,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         default=True,
         help="Use Flash Attention 2",
     )
+    parser.add_argument(
+        "--pretrained-model",
+        type=str,
+        default="",
+        help="Path to pretrained model (for adapter initialization). "
+             "If provided, adapter weights will be loaded from this checkpoint.",
+    )
 
 
 def add_training_arguments(parser: argparse.ArgumentParser):
@@ -240,13 +247,94 @@ def build_model(params: AttributeDict) -> FireRedAsrLlm:
         model.encoder = model.encoder.float()
         logging.info("Encoder converted to FP32")
 
+    if params.pretrained_model:
+        print(f"\n{'='*80}", flush=True)
+        print(f"[ADAPTER LOADING] Starting adapter loading from: {params.pretrained_model}", flush=True)
+        print(f"{'='*80}\n", flush=True)
+        logging.info(f"Loading pretrained weights from {params.pretrained_model}")
+        try:
+            pretrained = torch.load(params.pretrained_model, map_location="cpu", weights_only=False)
+            pretrained_state = pretrained['model_state_dict']
+            print(f"[ADAPTER LOADING] Pretrained model loaded, total keys: {len(pretrained_state)}", flush=True)
+
+
+            # Extract adapter weights
+            adapter_keys = {k: v for k, v in pretrained_state.items()
+                           if k.startswith('encoder_projector')}
+
+            if adapter_keys:
+                print(f"[ADAPTER LOADING] Found {len(adapter_keys)} adapter keys", flush=True)
+                missing, unexpected = model.load_state_dict(adapter_keys, strict=False)
+                print(f"[ADAPTER LOADING] ✅ Successfully loaded {len(adapter_keys)} adapter keys!", flush=True)
+                logging.info(f"✅ Loaded {len(adapter_keys)} adapter keys from pretrained model")
+                for k in adapter_keys.keys():
+                    print(f"[ADAPTER LOADING]   - {k}", flush=True)
+                    logging.info(f"  - {k}")
+                print(f"{'='*80}\n", flush=True)
+            else:
+                print(f"[ADAPTER LOADING] ⚠️ WARNING: No adapter keys found in pretrained model!", flush=True)
+                logging.warning("⚠️ No adapter keys found in pretrained model!")
+
+            # Check for LoRA weights in pretrained model
+            # NOTE: Pretrained models should have LoRA weights pre-merged into base LLM offline.
+            # Use training/scripts/merge_lora_to_base.py to merge before training.
+            # Only adapter weights will be loaded from pretrained checkpoints.
+            lora_keys = [k for k in pretrained_state.keys() if 'lora' in k.lower()]
+            if lora_keys:
+                print(f"[LORA WARNING] ⚠️ Found {len(lora_keys)} LoRA keys in pretrained model!", flush=True)
+                print(f"[LORA WARNING] Pretrained LoRA weights will NOT be loaded (merge offline first)", flush=True)
+                print(f"[LORA WARNING] Use: python training/scripts/merge_lora_to_base.py", flush=True)
+                logging.warning(f"⚠️ Found {len(lora_keys)} LoRA keys in pretrained model!")
+                logging.warning("Pretrained LoRA weights will NOT be loaded (merge offline first)")
+                logging.warning("Recommendation: Use training/scripts/merge_lora_to_base.py to merge LoRA into base LLM")
+            else:
+                print(f"[LORA INFO] ℹ️ No LoRA keys in pretrained model (expected)", flush=True)
+                logging.info("ℹ️ No LoRA keys in pretrained model (clean adapter checkpoint)")
+
+        except Exception as e:
+            print(f"[ADAPTER LOADING] ❌ ERROR: {e}", flush=True)
+            logging.error(f"❌ Failed to load pretrained model: {e}")
+            logging.error("Continuing with random adapter initialization...")
+    else:
+        print(f"\n[ADAPTER LOADING] ⚠️ WARNING: No --pretrained-model specified!", flush=True)
+        print(f"[ADAPTER LOADING] Adapter will be randomly initialized!\n", flush=True)
+        logging.warning("⚠️ No pretrained model specified - adapter will be randomly initialized!")
+        logging.warning("⚠️ This may lead to poor performance. Recommend using --pretrained-model")
+
     # Load Stage 1 checkpoint for Stage 2
     if params.training_stage == 2 and params.stage1_checkpoint:
+        print(f"\n{'='*80}", flush=True)
+        print(f"[STAGE1 CHECKPOINT] Loading from: {params.stage1_checkpoint}", flush=True)
+        print(f"{'='*80}\n", flush=True)
         logging.info(f"Loading Stage 1 checkpoint: {params.stage1_checkpoint}")
+
         checkpoint = torch.load(params.stage1_checkpoint, map_location="cpu", weights_only=False)
+
+        # Validate checkpoint structure
+        adapter_keys = [k for k in checkpoint.keys() if 'encoder_projector' in k]
+        lora_keys = [k for k in checkpoint.keys() if 'lora' in k.lower()]
+
+        print(f"[STAGE1 CHECKPOINT] Checkpoint contains {len(adapter_keys)} adapter keys, {len(lora_keys)} LoRA keys", flush=True)
+        logging.info(f"Stage 1 checkpoint contains {len(adapter_keys)} adapter keys, {len(lora_keys)} LoRA keys")
+
+        if lora_keys:
+            print(f"[STAGE1 CHECKPOINT] ⚠️ WARNING: Stage 1 checkpoint should not contain LoRA weights!", flush=True)
+            logging.warning("⚠️ Stage 1 checkpoint should not contain LoRA weights!")
+
+        # Load adapter weights
         missing_keys, unexpected_keys = model.load_state_dict(checkpoint, strict=False)
-        logging.info(f"Missing keys: {missing_keys}")
-        logging.info(f"Unexpected keys: {unexpected_keys}")
+
+        # Filter out expected missing keys (LoRA is expected to be missing from Stage 1)
+        unexpected_missing = [k for k in missing_keys if 'lora' not in k.lower()]
+        if unexpected_missing:
+            print(f"[STAGE1 CHECKPOINT] ❌ Unexpected missing keys (non-LoRA): {unexpected_missing[:10]}", flush=True)
+            logging.error(f"Unexpected missing keys (non-LoRA): {unexpected_missing[:10]}")
+
+        print(f"[STAGE1 CHECKPOINT] ✅ Loaded adapter weights from Stage 1 checkpoint", flush=True)
+        print(f"[STAGE1 CHECKPOINT] ℹ️ LoRA weights initialized randomly (expected for Stage 2 start)", flush=True)
+        logging.info(f"✅ Loaded adapter weights from Stage 1 checkpoint")
+        logging.info(f"ℹ️ LoRA weights initialized randomly (expected for Stage 2 start)")
+        print(f"{'='*80}\n", flush=True)
 
     # Log trainable parameters
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -255,6 +343,49 @@ def build_model(params: AttributeDict) -> FireRedAsrLlm:
                  f"({100 * trainable_params / total_params:.2f}%)")
 
     return model
+
+
+def validate_chat_template(template, stage="training"):
+    """
+    Validate chat template structure to ensure training/inference consistency.
+
+    This validation ensures that:
+    1. Template includes required role markers (<|im_start|>, user, assistant)
+    2. Training template ends with <|im_end|> (model should predict EOS)
+    3. Inference template does NOT end with <|im_end|> (model generates from right position)
+
+    This difference is intentional and matches icefall's design.
+    """
+    from jinja2 import Template as JinjaTemplate
+
+    test_messages = [
+        {"role": "user", "content": "<speech>请转写音频为文字"},
+        {"role": "assistant", "content": "测试文本"}
+    ]
+
+    try:
+        jinja_template = JinjaTemplate(template)
+        result = jinja_template.render(messages=test_messages)
+
+        # Check structure
+        assert '<|im_start|>user' in result, "Missing user role marker"
+        assert '<|im_start|>assistant' in result, "Missing assistant role marker"
+        assert '<speech>请转写音频为文字' in result, "Missing speech token"
+
+        # Training should end with <|im_end|>, inference should not
+        if stage == "training":
+            assert result.endswith('<|im_end|>'), "Training template should end with <|im_end|>"
+            logging.info(f"✅ {stage.capitalize()} template validation passed")
+        else:
+            assert not result.endswith('<|im_end|>'), "Inference template should NOT end with <|im_end|>"
+            logging.info(f"✅ {stage.capitalize()} template validation passed")
+
+        logging.debug(f"Template output:\n{result}")
+        return True
+
+    except Exception as e:
+        logging.error(f"❌ Template validation failed: {e}")
+        return False
 
 
 def preprocess_texts(
@@ -271,6 +402,9 @@ def preprocess_texts(
         target_ids: (batch_size, seq_len) with prompts masked using IGNORE_TOKEN_ID
     """
     texts = []
+    # Training template: includes <|im_end|> at the end so model learns to predict EOS
+    # This differs from inference template (which omits <|im_end|>) - see fireredasr/tokenizer/llm_tokenizer.py
+    # This design matches icefall's approach and is intentional
     TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content']}}{% if loop.last %}{{ '<|im_end|>'}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
 
     for i, msg in enumerate(messages):
@@ -627,6 +761,103 @@ def load_checkpoint(
     logging.info("Checkpoint loaded successfully")
 
 
+def estimate_training_steps(
+    cuts,
+    max_duration: float,
+    num_epochs: int,
+    world_size: int,
+    gradient_accumulation_steps: int,
+) -> int:
+    """
+    Estimate total training steps for learning rate scheduling.
+
+    Args:
+        cuts: Training CutSet (can be lazy)
+        max_duration: Maximum duration per batch
+        num_epochs: Number of training epochs
+        world_size: Number of GPUs
+        gradient_accumulation_steps: Gradient accumulation from DeepSpeed config
+
+    Returns:
+        Estimated total training steps
+    """
+    # Calculate total audio duration
+    # This works with both lazy and materialized cuts
+    total_duration = sum(cut.duration for cut in cuts)
+
+    logging.info(f"Total training audio duration: {total_duration:.2f} seconds "
+                 f"({total_duration/3600:.2f} hours)")
+
+    # Estimate steps per epoch
+    # Each batch can have up to max_duration seconds of audio
+    batches_per_epoch = total_duration / max_duration
+
+    # Account for distributed training
+    steps_per_epoch = batches_per_epoch / world_size / gradient_accumulation_steps
+
+    # Total steps across all epochs
+    total_steps = int(steps_per_epoch * num_epochs)
+
+    logging.info(f"Estimated training steps:")
+    logging.info(f"  - Batches per epoch: {batches_per_epoch:.0f}")
+    logging.info(f"  - Steps per epoch: {steps_per_epoch:.0f}")
+    logging.info(f"  - Total steps ({num_epochs} epochs): {total_steps}")
+
+    # Add 10% buffer to ensure decay completes
+    total_steps_with_buffer = int(total_steps * 1.1)
+    logging.info(f"  - Total steps (with 10% buffer): {total_steps_with_buffer}")
+
+    return total_steps_with_buffer
+
+
+def update_deepspeed_config_scheduler(
+    config_path: str,
+    total_num_steps: int,
+    warmup_num_steps: int = 100,
+) -> dict:
+    """
+    Load DeepSpeed config and update scheduler to use WarmupDecayLR.
+
+    Args:
+        config_path: Path to DeepSpeed JSON config
+        total_num_steps: Total training steps (calculated)
+        warmup_num_steps: Number of warmup steps
+
+    Returns:
+        Updated config dict
+    """
+    import json
+
+    logging.info(f"Loading DeepSpeed config from: {config_path}")
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
+    # Get max LR from optimizer config
+    max_lr = config.get('optimizer', {}).get('params', {}).get('lr', 1e-4)
+
+    # Update scheduler to WarmupDecayLR
+    old_scheduler = config.get('scheduler', {}).get('type', 'Unknown')
+    logging.info(f"Replacing scheduler: {old_scheduler} -> WarmupDecayLR")
+
+    config['scheduler'] = {
+        "type": "WarmupDecayLR",
+        "params": {
+            "warmup_min_lr": 0,
+            "warmup_max_lr": max_lr,
+            "warmup_num_steps": warmup_num_steps,
+            "total_num_steps": total_num_steps
+        }
+    }
+
+    logging.info(f"Scheduler configuration:")
+    logging.info(f"  - Type: WarmupDecayLR")
+    logging.info(f"  - Warmup: 0 -> {max_lr} over {warmup_num_steps} steps")
+    logging.info(f"  - Total steps: {total_num_steps}")
+    logging.info(f"  - Decay: Linear from step {warmup_num_steps} to {total_num_steps}")
+
+    return config
+
+
 def run(rank, world_size, args):
     """Main training function"""
     params = get_params()
@@ -681,32 +912,12 @@ def run(rank, world_size, args):
     # Get tokenizer
     tokenizer = LlmTokenizerWrapper.build_llm_tokenizer(params.llm_dir)
 
-    # Initialize DeepSpeed
-    if params.deepspeed:
-        logging.info("Initializing DeepSpeed")
-        model, optimizer, _, scheduler = deepspeed.initialize(
-            args=args,
-            model=model,
-            model_parameters=model.parameters()
-        )
-    else:
-        raise ValueError("This script requires DeepSpeed. Please use --deepspeed flag.")
+    # Validate chat template consistency
+    if rank == 0:
+        TRAINING_TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content']}}{% if loop.last %}{{ '<|im_end|>'}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
+        validate_chat_template(TRAINING_TEMPLATE, stage="training")
 
-    # Load checkpoint if resuming training
-    if params.start_epoch > 1:
-        checkpoint_path = f"{params.exp_dir}/epoch-{params.start_epoch - 1}.pt"
-        if os.path.exists(checkpoint_path):
-            logging.info(f"Loading checkpoint from {checkpoint_path}")
-            checkpoint = torch.load(checkpoint_path, map_location="cpu")
-            model.load_state_dict(checkpoint["model"], strict=False)
-            params.batch_idx_train = checkpoint.get("batch_idx_train", 0)
-            logging.info(f"Resumed training from epoch {params.start_epoch}")
-            sys.stdout.flush()
-        else:
-            logging.warning(f"Checkpoint {checkpoint_path} not found, starting from epoch {params.start_epoch}")
-            sys.stdout.flush()
-
-    # Setup data
+    # Setup data BEFORE DeepSpeed initialization (needed for LR scheduler calculation)
     logging.info("Loading datasets")
     multi_dataset = MultiDataset(fbank_dir=str(params.manifest_dir))
 
@@ -736,6 +947,73 @@ def run(rank, world_size, args):
     asr_datamodule = AsrDataModule(args)
     train_dl = asr_datamodule.train_dataloaders(cuts_train)
     valid_dl = asr_datamodule.valid_dataloaders(cuts_valid)
+
+    # Initialize DeepSpeed with dynamic LR scheduler
+    if params.deepspeed:
+        # 1. Read original DeepSpeed config to get gradient_accumulation_steps
+        import json
+        import tempfile
+        with open(params.deepspeed_config, 'r') as f:
+            ds_config_original = json.load(f)
+        gradient_accumulation_steps = ds_config_original.get('gradient_accumulation_steps', 1)
+
+        # 2. Calculate total training steps
+        logging.info("=" * 80)
+        logging.info("Calculating learning rate schedule")
+        total_num_steps = estimate_training_steps(
+            cuts=cuts_train,
+            max_duration=params.max_duration,
+            num_epochs=params.num_epochs,
+            world_size=world_size,
+            gradient_accumulation_steps=gradient_accumulation_steps,
+        )
+
+        # 3. Update DeepSpeed config with calculated steps
+        ds_config_updated = update_deepspeed_config_scheduler(
+            config_path=params.deepspeed_config,
+            total_num_steps=total_num_steps,
+            warmup_num_steps=100,  # Keep same warmup as before
+        )
+
+        # 4. Write updated config to temporary file
+        # DeepSpeed requires config to be passed via args, not as config parameter
+        temp_config_fd, temp_config_path = tempfile.mkstemp(suffix='.json', prefix='ds_config_', dir=params.exp_dir)
+        with os.fdopen(temp_config_fd, 'w') as f:
+            json.dump(ds_config_updated, f, indent=4)
+        logging.info(f"Temporary DeepSpeed config written to: {temp_config_path}")
+
+        # 5. Update args to point to temporary config
+        original_config_path = params.deepspeed_config
+        params.deepspeed_config = temp_config_path
+        args.deepspeed_config = temp_config_path
+        logging.info("=" * 80)
+
+        # 6. Initialize DeepSpeed (will read config from args.deepspeed_config)
+        logging.info("Initializing DeepSpeed with updated scheduler config")
+        model, optimizer, _, scheduler = deepspeed.initialize(
+            args=args,
+            model=model,
+            model_parameters=model.parameters()
+        )
+
+        # 7. Restore original config path in params (for reference)
+        params.deepspeed_config = original_config_path
+    else:
+        raise ValueError("This script requires DeepSpeed. Please use --deepspeed flag.")
+
+    # Load checkpoint if resuming training
+    if params.start_epoch > 1:
+        checkpoint_path = f"{params.exp_dir}/epoch-{params.start_epoch - 1}.pt"
+        if os.path.exists(checkpoint_path):
+            logging.info(f"Loading checkpoint from {checkpoint_path}")
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            model.load_state_dict(checkpoint["model"], strict=False)
+            params.batch_idx_train = checkpoint.get("batch_idx_train", 0)
+            logging.info(f"Resumed training from epoch {params.start_epoch}")
+            sys.stdout.flush()
+        else:
+            logging.warning(f"Checkpoint {checkpoint_path} not found, starting from epoch {params.start_epoch}")
+            sys.stdout.flush()
 
     # Tensorboard
     tb_writer = None
