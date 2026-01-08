@@ -5,7 +5,10 @@ import glob
 import os
 import sys
 
-from fireredasr.models.fireredasr import FireRedAsr
+# Ensure HF registration for FireRedASR
+import fireredasr.hf  # noqa: F401
+from transformers import AutoModel
+from fireredasr.hf import FireRedASRConfig
 
 
 parser = argparse.ArgumentParser()
@@ -40,7 +43,13 @@ def main(args):
     wavs = get_wav_info(args)
     fout = open(args.output, "w") if args.output else None
 
-    model = FireRedAsr.from_pretrained(args.asr_type, args.model_dir)
+    # Load via Transformers AutoModel with our custom config
+    config = FireRedASRConfig(asr_type=args.asr_type)
+    model = AutoModel.from_pretrained(
+        args.model_dir,
+        config=config,
+        use_gpu=args.use_gpu,
+    )
 
     batch_uttid = []
     batch_wav_path = []
@@ -51,28 +60,25 @@ def main(args):
         if len(batch_wav_path) < args.batch_size and i != len(wavs) - 1:
             continue
 
-        results = model.transcribe(
-            batch_uttid,
-            batch_wav_path,
-            {
-            "use_gpu": args.use_gpu,
-            "beam_size": args.beam_size,
-            "nbest": args.nbest,
-            "decode_max_len": args.decode_max_len,
-            "softmax_smoothing": args.softmax_smoothing,
-            "aed_length_penalty": args.aed_length_penalty,
-            "eos_penalty": args.eos_penalty,
-            "decode_min_len": args.decode_min_len,
-            "repetition_penalty": args.repetition_penalty,
-            "llm_length_penalty": args.llm_length_penalty,
-            "temperature": args.temperature
-            }
+        # Hugging Face-style generation
+        out = model.generate(
+            wav_paths=batch_wav_path,
+            beam_size=args.beam_size,
+            max_new_tokens=args.decode_max_len,
+            nbest=args.nbest,
+            repetition_penalty=args.repetition_penalty,
+            length_penalty=(
+                args.aed_length_penalty if args.asr_type == "aed" else args.llm_length_penalty
+            ),
+            eos_penalty=args.eos_penalty,
+            temperature=args.temperature,
         )
 
-        for result in results:
+        for uttid, text in zip(batch_uttid, out.sequences):
+            result = {"uttid": uttid, "text": text, "rtf": f"{out.rtf:.4f}"}
             print(result)
             if fout is not None:
-                fout.write(f"{result['uttid']}\t{result['text']}\n")
+                fout.write(f"{uttid}\t{text}\n")
 
         batch_uttid = []
         batch_wav_path = []

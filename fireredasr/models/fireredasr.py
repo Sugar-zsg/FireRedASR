@@ -115,7 +115,7 @@ def load_fireredasr_aed_model(model_path):
 
 
 def load_firered_llm_model_and_tokenizer(model_path, encoder_path, llm_dir):
-    package = torch.load(model_path, map_location=lambda storage, loc: storage)
+    package = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)
     package["args"].encoder_path = encoder_path
     package["args"].llm_dir = llm_dir
     print("model args:", package["args"])

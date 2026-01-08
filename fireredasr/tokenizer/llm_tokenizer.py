@@ -55,6 +55,7 @@ class LlmTokenizerWrapper:
         texts = []
         if not decode:
             TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content']}}{% if loop.last %}{{ '<|im_end|>'}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
+            assert '<|im_end|>' in TEMPLATE, "Non-decode template should include <|im_end|>"
         else:
             TEMPLATE = "{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content']}}{% if loop.last %}{{''}}{% else %}{{ '<|im_end|>\n' }}{% endif %}{% endfor %}"
         for i, msg in enumerate(messages):
