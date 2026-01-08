@@ -204,6 +204,8 @@ def get_params() -> AttributeDict:
             "best_valid_epoch": -1,
             "batch_idx_train": 0,
             "cur_epoch": 1,
+            "patience": 3,  # Early stopping: tolerate 3 epochs without improvement
+            "epochs_without_improvement": 0,  # Counter for early stopping
         }
     )
     return params
@@ -565,8 +567,10 @@ def compute_validation_loss(
 
             tot_loss["loss"] = info["loss"]
 
-            if batch_idx >= 10:  # Limit validation batches
-                break
+            # Use full validation set for reliable metrics
+            # Log progress every 50 batches
+            if batch_idx % 50 == 0 and batch_idx > 0:
+                logging.info(f"Validation batch {batch_idx}...")
 
     return tot_loss
 
@@ -761,67 +765,17 @@ def load_checkpoint(
     logging.info("Checkpoint loaded successfully")
 
 
-def estimate_training_steps(
-    cuts,
-    max_duration: float,
-    num_epochs: int,
-    world_size: int,
-    gradient_accumulation_steps: int,
-) -> int:
-    """
-    Estimate total training steps for learning rate scheduling.
-
-    Args:
-        cuts: Training CutSet (can be lazy)
-        max_duration: Maximum duration per batch
-        num_epochs: Number of training epochs
-        world_size: Number of GPUs
-        gradient_accumulation_steps: Gradient accumulation from DeepSpeed config
-
-    Returns:
-        Estimated total training steps
-    """
-    # Calculate total audio duration
-    # This works with both lazy and materialized cuts
-    total_duration = sum(cut.duration for cut in cuts)
-
-    logging.info(f"Total training audio duration: {total_duration:.2f} seconds "
-                 f"({total_duration/3600:.2f} hours)")
-
-    # Estimate steps per epoch
-    # Each batch can have up to max_duration seconds of audio
-    batches_per_epoch = total_duration / max_duration
-
-    # Account for distributed training
-    steps_per_epoch = batches_per_epoch / world_size / gradient_accumulation_steps
-
-    # Total steps across all epochs
-    total_steps = int(steps_per_epoch * num_epochs)
-
-    logging.info(f"Estimated training steps:")
-    logging.info(f"  - Batches per epoch: {batches_per_epoch:.0f}")
-    logging.info(f"  - Steps per epoch: {steps_per_epoch:.0f}")
-    logging.info(f"  - Total steps ({num_epochs} epochs): {total_steps}")
-
-    # Add 10% buffer to ensure decay completes
-    total_steps_with_buffer = int(total_steps * 1.1)
-    logging.info(f"  - Total steps (with 10% buffer): {total_steps_with_buffer}")
-
-    return total_steps_with_buffer
-
-
 def update_deepspeed_config_scheduler(
     config_path: str,
-    total_num_steps: int,
-    warmup_num_steps: int = 100,
 ) -> dict:
     """
-    Load DeepSpeed config and update scheduler to use WarmupDecayLR.
+    Load DeepSpeed config and update scheduler to use WarmupLR.
+
+    NOTE: Changed from WarmupDecayLR to WarmupLR to prevent LR decay to 0.
+    This matches icefall's approach and prevents overfitting in later epochs.
 
     Args:
         config_path: Path to DeepSpeed JSON config
-        total_num_steps: Total training steps (calculated)
-        warmup_num_steps: Number of warmup steps
 
     Returns:
         Updated config dict
@@ -835,25 +789,23 @@ def update_deepspeed_config_scheduler(
     # Get max LR from optimizer config
     max_lr = config.get('optimizer', {}).get('params', {}).get('lr', 1e-4)
 
-    # Update scheduler to WarmupDecayLR
+    # Update scheduler to WarmupLR (no decay!)
     old_scheduler = config.get('scheduler', {}).get('type', 'Unknown')
-    logging.info(f"Replacing scheduler: {old_scheduler} -> WarmupDecayLR")
+    logging.info(f"Replacing scheduler: {old_scheduler} -> WarmupLR")
 
     config['scheduler'] = {
-        "type": "WarmupDecayLR",
+        "type": "WarmupLR",
         "params": {
             "warmup_min_lr": 0,
             "warmup_max_lr": max_lr,
-            "warmup_num_steps": warmup_num_steps,
-            "total_num_steps": total_num_steps
+            "warmup_num_steps": 100
         }
     }
 
     logging.info(f"Scheduler configuration:")
-    logging.info(f"  - Type: WarmupDecayLR")
-    logging.info(f"  - Warmup: 0 -> {max_lr} over {warmup_num_steps} steps")
-    logging.info(f"  - Total steps: {total_num_steps}")
-    logging.info(f"  - Decay: Linear from step {warmup_num_steps} to {total_num_steps}")
+    logging.info(f"  - Type: WarmupLR")
+    logging.info(f"  - Warmup: 0 -> {max_lr} over 100 steps")
+    logging.info(f"  - LR after warmup: {max_lr} (constant, no decay)")
 
     return config
 
@@ -948,55 +900,32 @@ def run(rank, world_size, args):
     train_dl = asr_datamodule.train_dataloaders(cuts_train)
     valid_dl = asr_datamodule.valid_dataloaders(cuts_valid)
 
-    # Initialize DeepSpeed with dynamic LR scheduler
+    # Initialize DeepSpeed with WarmupLR scheduler
     if params.deepspeed:
-        # 1. Read original DeepSpeed config to get gradient_accumulation_steps
         import json
         import tempfile
-        with open(params.deepspeed_config, 'r') as f:
-            ds_config_original = json.load(f)
-        gradient_accumulation_steps = ds_config_original.get('gradient_accumulation_steps', 1)
 
-        # 2. Calculate total training steps
-        logging.info("=" * 80)
-        logging.info("Calculating learning rate schedule")
-        total_num_steps = estimate_training_steps(
-            cuts=cuts_train,
-            max_duration=params.max_duration,
-            num_epochs=params.num_epochs,
-            world_size=world_size,
-            gradient_accumulation_steps=gradient_accumulation_steps,
-        )
-
-        # 3. Update DeepSpeed config with calculated steps
         ds_config_updated = update_deepspeed_config_scheduler(
             config_path=params.deepspeed_config,
-            total_num_steps=total_num_steps,
-            warmup_num_steps=100,  # Keep same warmup as before
         )
 
-        # 4. Write updated config to temporary file
-        # DeepSpeed requires config to be passed via args, not as config parameter
         temp_config_fd, temp_config_path = tempfile.mkstemp(suffix='.json', prefix='ds_config_', dir=params.exp_dir)
         with os.fdopen(temp_config_fd, 'w') as f:
             json.dump(ds_config_updated, f, indent=4)
         logging.info(f"Temporary DeepSpeed config written to: {temp_config_path}")
 
-        # 5. Update args to point to temporary config
         original_config_path = params.deepspeed_config
         params.deepspeed_config = temp_config_path
         args.deepspeed_config = temp_config_path
-        logging.info("=" * 80)
+        logging.info("=" * 40)
 
-        # 6. Initialize DeepSpeed (will read config from args.deepspeed_config)
-        logging.info("Initializing DeepSpeed with updated scheduler config")
+        logging.info("Initializing DeepSpeed with WarmupLR scheduler")
         model, optimizer, _, scheduler = deepspeed.initialize(
             args=args,
             model=model,
             model_parameters=model.parameters()
         )
 
-        # 7. Restore original config path in params (for reference)
         params.deepspeed_config = original_config_path
     else:
         raise ValueError("This script requires DeepSpeed. Please use --deepspeed flag.")
@@ -1047,13 +976,90 @@ def run(rank, world_size, args):
             rank=rank,
         )
 
-        # Save checkpoint at end of epoch
         if rank == 0:
-            save_checkpoint(params, model, optimizer, scheduler, train_dl.sampler)
+            print(f"\n[VALIDATION] Running full validation after epoch {epoch}...", flush=True)
+        logging.info(f"Epoch {epoch} completed, running full validation...")
+
+        valid_info = compute_validation_loss(
+            params=params,
+            tokenizer=tokenizer,
+            model=model,
+            valid_dl=valid_dl,
+            world_size=world_size,
+        )
+
+        valid_loss = valid_info.norm('loss')
+
+        if rank == 0:
+            print(f"[VALIDATION] Epoch {epoch} | Valid Loss: {valid_loss:.4f} | Best: {params.best_valid_loss:.4f}", flush=True)
+        logging.info(f"[VALIDATION] Epoch {epoch} | Valid Loss: {valid_loss:.4f} | Best: {params.best_valid_loss:.4f}")
+
+        if tb_writer is not None and rank == 0:
+            tb_writer.add_scalar("valid/loss_epoch", valid_loss, epoch)
+            tb_writer.flush()
+
+        # === NEW: Best model tracking ===
+        if valid_loss < params.best_valid_loss:
+            params.best_valid_loss = valid_loss
+            params.best_valid_epoch = epoch
+            params.epochs_without_improvement = 0
+
+            if rank == 0:
+                print(f"✅ New best validation loss: {valid_loss:.4f}", flush=True)
+            logging.info(f"✅ New best validation loss: {valid_loss:.4f}")
+
+            # Save checkpoint as best
+            if rank == 0:
+                save_checkpoint(params, model, optimizer, scheduler, train_dl.sampler)
+
+                # Copy to best-model.pt (DeepSpeed saves as directory with pytorch_model.bin inside)
+                import shutil
+                src = f"{params.exp_dir}/epoch-{epoch}.pt"
+                dst = f"{params.exp_dir}/best-model.pt"
+
+                # Handle both file and directory checkpoint formats
+                if os.path.isfile(src):
+                    # If it's a single file, copy directly
+                    shutil.copy(src, dst)
+                    logging.info(f"Saved as best checkpoint: {dst}")
+                    print(f"Saved best checkpoint: best-model.pt", flush=True)
+                elif os.path.isdir(src):
+                    # If it's a directory (DeepSpeed format), copy the whole directory
+                    if os.path.exists(dst):
+                        shutil.rmtree(dst)
+                    shutil.copytree(src, dst)
+                    logging.info(f"Saved as best checkpoint directory: {dst}/")
+                    print(f"Saved best checkpoint: best-model.pt/", flush=True)
+        else:
+            params.epochs_without_improvement += 1
+            if rank == 0:
+                print(f"⚠️ Validation loss increased (best: epoch {params.best_valid_epoch}, {params.epochs_without_improvement} epochs without improvement)", flush=True)
+            logging.info(f"⚠️ Validation loss increased (previous best: epoch {params.best_valid_epoch})")
+            logging.info(f"Epochs without improvement: {params.epochs_without_improvement}/{params.patience}")
+
+            # Save checkpoint anyway
+            if rank == 0:
+                save_checkpoint(params, model, optimizer, scheduler, train_dl.sampler)
+
+        # === NEW: Early stopping ===
+        if params.epochs_without_improvement >= params.patience:
+            if rank == 0:
+                print(f"\n{'='*80}", flush=True)
+                print(f"[EARLY STOPPING] Triggered at epoch {epoch}", flush=True)
+                print(f"Best model: epoch {params.best_valid_epoch} with loss {params.best_valid_loss:.4f}", flush=True)
+                print(f"{'='*80}\n", flush=True)
+            logging.info(f"Early stopping triggered at epoch {epoch}")
+            logging.info(f"Best model was at epoch {params.best_valid_epoch} with loss {params.best_valid_loss:.4f}")
+            break
 
         logging.info(f"Epoch {epoch} completed")
+        sys.stdout.flush()
 
     logging.info("Training completed!")
+    if rank == 0:
+        print(f"\n[TRAINING COMPLETE]", flush=True)
+        print(f"Best model: epoch {params.best_valid_epoch} with loss {params.best_valid_loss:.4f}", flush=True)
+        print(f"Checkpoint saved as: {params.exp_dir}/best-model.pt", flush=True)
 
 
 def main():
