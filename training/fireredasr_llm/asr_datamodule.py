@@ -141,6 +141,12 @@ class AsrDataModule:
             default=True,
             help="Enable MUSAN noise mixing for training.",
         )
+        group.add_argument(
+            "--cmvn-path",
+            type=Path,
+            default=None,
+            help="Path to CMVN statistics file (cmvn.ark). If provided, CMVN will be applied during training.",
+        )
 
     def train_dataloaders(
         self,
@@ -166,8 +172,54 @@ class AsrDataModule:
         else:
             logging.info("Disable MUSAN")
 
-        # SpecAugment
+        # CMVN normalization
         input_transforms = []
+        if hasattr(self.args, 'cmvn_path') and self.args.cmvn_path is not None and self.args.cmvn_path.exists():
+            logging.info(f"✓ [TRAIN] Enable CMVN normalization from {self.args.cmvn_path}")
+            print(f"[TRAIN] Loading CMVN statistics from: {self.args.cmvn_path}", flush=True)
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from fireredasr.data.asr_feat import CMVN
+
+            cmvn = CMVN(str(self.args.cmvn_path))
+            print(f"[TRAIN] CMVN loaded successfully: dim={cmvn.dim}, will normalize features to mean≈0, std≈1", flush=True)
+
+            # Create a wrapper to make CMVN compatible with Lhotse
+            class CMVNTransform:
+                def __init__(self, cmvn_obj):
+                    self.cmvn = cmvn_obj
+
+                def __call__(self, features, **kwargs):
+                    # features: (T, F) numpy array or torch tensor
+                    # kwargs: Lhotse may pass supervision_segments and other args, we ignore them
+                    import torch
+                    import numpy as np
+
+                    is_tensor = isinstance(features, torch.Tensor)
+                    if is_tensor:
+                        device = features.device
+                        dtype = features.dtype
+                        features = features.cpu().numpy()
+
+                    # Apply CMVN
+                    normalized = self.cmvn(features)
+
+                    if is_tensor:
+                        normalized = torch.from_numpy(normalized).to(device=device, dtype=dtype)
+
+                    return normalized
+
+            input_transforms.append(CMVNTransform(cmvn))
+        else:
+            if not hasattr(self.args, 'cmvn_path') or self.args.cmvn_path is None:
+                logging.info("✗ [TRAIN] CMVN not provided, skipping CMVN normalization")
+                print(f"[TRAIN] CMVN normalization: DISABLED (no --cmvn-path provided)", flush=True)
+            else:
+                logging.warning(f"✗ [TRAIN] CMVN file not found at {self.args.cmvn_path}, skipping CMVN normalization")
+                print(f"[TRAIN] WARNING: CMVN file not found at {self.args.cmvn_path}", flush=True)
+
+        # SpecAugment
         if self.args.enable_spec_aug:
             logging.info("Enable SpecAugment")
             logging.info(f"Time warp factor: {self.args.spec_aug_time_warp_factor}")
@@ -214,6 +266,12 @@ class AsrDataModule:
                 shuffle_buffer_size=self.args.num_buckets * 5000,
                 drop_last=self.args.drop_last,
             )
+            shuffle_status = "✓ ENABLED" if self.args.shuffle else "✗ DISABLED"
+            print(f"[TRAIN] Data Shuffling: {shuffle_status}", flush=True)
+            print(f"[TRAIN]   - Sampler: DynamicBucketingSampler", flush=True)
+            print(f"[TRAIN]   - Num buckets: {self.args.num_buckets}", flush=True)
+            print(f"[TRAIN]   - Shuffle buffer size: {self.args.num_buckets * 5000}", flush=True)
+            logging.info(f"Training data shuffle: {self.args.shuffle}")
         else:
             logging.info("Using SimpleCutSampler")
             train_sampler = SimpleCutSampler(
@@ -221,6 +279,10 @@ class AsrDataModule:
                 max_duration=self.args.max_duration,
                 shuffle=self.args.shuffle,
             )
+            shuffle_status = "✓ ENABLED" if self.args.shuffle else "✗ DISABLED"
+            print(f"[TRAIN] Data Shuffling: {shuffle_status}", flush=True)
+            print(f"[TRAIN]   - Sampler: SimpleCutSampler", flush=True)
+            logging.info(f"Training data shuffle: {self.args.shuffle}")
 
         # Load sampler state if resuming
         if sampler_state_dict is not None:
@@ -252,8 +314,47 @@ class AsrDataModule:
           cuts_valid: CutSet for validation
         """
         logging.info("Creating validation dataset")
+
+        # CMVN normalization for validation (same as training)
+        input_transforms = []
+        if hasattr(self.args, 'cmvn_path') and self.args.cmvn_path is not None and self.args.cmvn_path.exists():
+            logging.info(f"✓ [VALID] Enable CMVN normalization for validation from {self.args.cmvn_path}")
+            print(f"[VALID] Loading CMVN statistics from: {self.args.cmvn_path}", flush=True)
+            import sys
+            from pathlib import Path
+            sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+            from fireredasr.data.asr_feat import CMVN
+
+            cmvn = CMVN(str(self.args.cmvn_path))
+            print(f"[VALID] CMVN loaded successfully for validation", flush=True)
+
+            class CMVNTransform:
+                def __init__(self, cmvn_obj):
+                    self.cmvn = cmvn_obj
+
+                def __call__(self, features, **kwargs):
+                    # kwargs: Lhotse may pass supervision_segments and other args, we ignore them
+                    import torch
+                    import numpy as np
+
+                    is_tensor = isinstance(features, torch.Tensor)
+                    if is_tensor:
+                        device = features.device
+                        dtype = features.dtype
+                        features = features.cpu().numpy()
+
+                    normalized = self.cmvn(features)
+
+                    if is_tensor:
+                        normalized = torch.from_numpy(normalized).to(device=device, dtype=dtype)
+
+                    return normalized
+
+            input_transforms.append(CMVNTransform(cmvn))
+
         validate = K2SpeechRecognitionDataset(
             input_strategy=PrecomputedFeatures(),
+            input_transforms=input_transforms if input_transforms else None,
             return_cuts=self.args.return_cuts,
         )
 

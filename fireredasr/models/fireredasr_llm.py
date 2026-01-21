@@ -18,7 +18,7 @@ class FireRedAsrLlm(nn.Module):
     @classmethod
     def load_encoder(cls, model_path):
         assert os.path.exists(model_path)
-        package = torch.load(model_path, map_location=lambda storage, loc: storage)
+        package = torch.load(model_path, map_location=lambda storage, loc: storage, weights_only=False)
         model = FireRedAsrAed.from_args(package["args"])
         if "model_state_dict" in package:
             model.load_state_dict(package["model_state_dict"], strict=False)
@@ -71,8 +71,8 @@ class FireRedAsrLlm(nn.Module):
             if args.use_lora:
                 from peft import LoraConfig, get_peft_model
                 lora_config = LoraConfig(
-                    r=64,
-                    lora_alpha=16,
+                    r=32,
+                    lora_alpha=64,
                     target_modules=[
                         "q_proj",
                         "k_proj",
@@ -82,7 +82,7 @@ class FireRedAsrLlm(nn.Module):
                         "gate_proj",
                         "down_proj",
                     ],
-                    lora_dropout=0.05,
+                    lora_dropout=0.1,
                     task_type="CAUSAL_LM",
                 )
                 llm = get_peft_model(llm, lora_config)

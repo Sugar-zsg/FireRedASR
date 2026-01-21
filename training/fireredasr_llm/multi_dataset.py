@@ -350,6 +350,36 @@ class MultiDataset:
         logging.info("Loading synthetic test dataset (test)")
         return load_manifest_lazy(self.fbank_dir / "test_dataset" / "test_cuts_test.jsonl.gz")
 
+    def dataset_test_augmented_train_cuts(self) -> CutSet:
+        """Load dataset_test_augmented training set (with pause extension and no-speech samples)"""
+        logging.info("Loading dataset_test_augmented train cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented" / "dataset_test_aug_cuts_train.jsonl.gz")
+
+    def dataset_test_augmented_dev_cuts(self) -> CutSet:
+        """Load dataset_test_augmented validation set"""
+        logging.info("Loading dataset_test_augmented dev cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented" / "dataset_test_aug_cuts_dev.jsonl.gz")
+
+    def dataset_test_augmented_test_cuts(self) -> CutSet:
+        """Load dataset_test_augmented test set"""
+        logging.info("Loading dataset_test_augmented test cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented" / "dataset_test_aug_cuts_test.jsonl.gz")
+
+    def dataset_test_augmented_v2_train_cuts(self) -> CutSet:
+        """Load dataset_test_augmented_v2 training set (10% pause+background, 5% no-speech)"""
+        logging.info("Loading dataset_test_augmented_v2 train cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented_v2" / "dataset_test_cuts_train.jsonl.gz")
+
+    def dataset_test_augmented_v2_dev_cuts(self) -> CutSet:
+        """Load dataset_test_augmented_v2 validation set"""
+        logging.info("Loading dataset_test_augmented_v2 dev cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented_v2" / "dataset_test_cuts_dev.jsonl.gz")
+
+    def dataset_test_augmented_v2_test_cuts(self) -> CutSet:
+        """Load dataset_test_augmented_v2 test set"""
+        logging.info("Loading dataset_test_augmented_v2 test cuts")
+        return load_manifest_lazy(self.fbank_dir / "dataset_test_augmented_v2" / "dataset_test_cuts_test.jsonl.gz")
+
     def custom_train_cuts(self) -> CutSet:
         """Load custom dataset from urls.txt + ref.txt (train)"""
         logging.info("Loading custom dataset (train)")

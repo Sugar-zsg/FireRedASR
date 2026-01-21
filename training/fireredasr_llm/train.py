@@ -103,6 +103,13 @@ def add_model_arguments(parser: argparse.ArgumentParser):
         help="Path to pretrained model (for adapter initialization). "
              "If provided, adapter weights will be loaded from this checkpoint.",
     )
+    parser.add_argument(
+        "--enable-text-cleaning",
+        type=str2bool,
+        default=True,
+        help="Enable text cleaning (remove punctuation, spaces, normalize). "
+             "Should match evaluation metrics processing.",
+    )
 
 
 def add_training_arguments(parser: argparse.ArgumentParser):
@@ -158,8 +165,8 @@ def add_training_arguments(parser: argparse.ArgumentParser):
         "--dataset",
         type=str,
         default="aishell",
-        choices=["aishell", "all", "test", "custom"],
-        help="Which real dataset to use: aishell (single), all (multi-dataset), test (synthetic), or custom (urls.txt + ref.txt)",
+        choices=["aishell", "all", "test", "custom", "test_augmented", "test_augmented_v2"],
+        help="Which real dataset to use: aishell (single), all (multi-dataset), test (synthetic), custom (urls.txt + ref.txt), test_augmented (augmented 50%%), or test_augmented_v2 (augmented 10%% pause+background + 5%% no-speech)",
     )
     # DeepSpeed arguments
     parser.add_argument(
@@ -492,7 +499,15 @@ def compute_loss(
     # Prepare messages in chat format
     messages = []
     for text in texts:
-        text = text.replace(" ", "")  # Remove spaces for Chinese
+        # Clean text based on enable_text_cleaning flag
+        if params.enable_text_cleaning:
+            # Clean text: remove punctuation, spaces, and normalize
+            # This ensures consistency with evaluation metrics (WER/CER)
+            text = LlmTokenizerWrapper.clean_text(text)
+        else:
+            # Only remove spaces for Chinese (legacy behavior)
+            text = text.replace(" ", "")
+
         message = [
             {"role": "user", "content": f"{DEFAULT_SPEECH_TOKEN}请转写音频为文字"},
             {"role": "assistant", "content": text},
@@ -855,6 +870,58 @@ def run(rank, world_size, args):
     logging.info(f"World size: {world_size}, Rank: {rank}")
     sys.stdout.flush()
 
+    # Print critical configuration settings
+    if rank == 0:
+        print("\n" + "=" * 80, flush=True)
+        print("[CONFIG] Critical Training Configuration", flush=True)
+        print("=" * 80, flush=True)
+
+        # Random seed configuration
+        print(f"[CONFIG] Random Seed: {params.seed} (FIXED)", flush=True)
+        print(f"[CONFIG]   - Shuffle order is deterministic and reproducible", flush=True)
+        print(f"[CONFIG]   - Same seed → same shuffle order → same first epoch loss", flush=True)
+        print(f"[CONFIG]   - Different epochs still have different shuffle orders", flush=True)
+
+        # CMVN configuration
+        if hasattr(params, 'cmvn_path') and params.cmvn_path is not None:
+            cmvn_exists = Path(params.cmvn_path).exists()
+            print(f"[CONFIG] CMVN Normalization: ENABLED", flush=True)
+            print(f"[CONFIG]   - CMVN file: {params.cmvn_path}", flush=True)
+            print(f"[CONFIG]   - File exists: {cmvn_exists}", flush=True)
+            if cmvn_exists:
+                logging.info(f"✓ CMVN normalization will be applied from {params.cmvn_path}")
+            else:
+                logging.warning(f"✗ CMVN file not found at {params.cmvn_path}, normalization will be skipped!")
+        else:
+            print(f"[CONFIG] CMVN Normalization: DISABLED (not provided)", flush=True)
+            logging.info("CMVN normalization is disabled")
+
+        # Text cleaning configuration
+        if params.enable_text_cleaning:
+            print(f"[CONFIG] Text Cleaning: ENABLED", flush=True)
+            print(f"[CONFIG]   - Will remove punctuation and normalize text", flush=True)
+            print(f"[CONFIG]   - Consistent with evaluation metrics (WER/CER)", flush=True)
+            logging.info("✓ Text cleaning enabled: punctuation removal + normalization")
+        else:
+            print(f"[CONFIG] Text Cleaning: DISABLED", flush=True)
+            print(f"[CONFIG]   - Legacy mode: only remove spaces", flush=True)
+            logging.warning("Text cleaning disabled - training targets may not match evaluation metrics")
+
+        # Data shuffling configuration
+        shuffle_status = "ENABLED ✓" if params.shuffle else "DISABLED ✗"
+        print(f"[CONFIG] Data Shuffling: {shuffle_status}", flush=True)
+        if params.shuffle:
+            print(f"[CONFIG]   - Training data will be shuffled every epoch", flush=True)
+            print(f"[CONFIG]   - Ensures random order and better generalization", flush=True)
+            logging.info("✓ Data shuffling enabled for training")
+        else:
+            print(f"[CONFIG]   - WARNING: Training data will NOT be shuffled", flush=True)
+            print(f"[CONFIG]   - May lead to overfitting or poor generalization", flush=True)
+            logging.warning("✗ Data shuffling disabled - this may harm training quality")
+
+        print("=" * 80 + "\n", flush=True)
+        sys.stdout.flush()
+
     # Set random seed
     fix_random_seed(params.seed + rank)
 
@@ -873,25 +940,54 @@ def run(rank, world_size, args):
     logging.info("Loading datasets")
     multi_dataset = MultiDataset(fbank_dir=str(params.manifest_dir))
 
+    # Debug: Print dataset selection parameters
+    print("=" * 80)
+    print("[DEBUG] Dataset Selection Parameters:")
+    print(f"  --dataset: {params.dataset}")
+    print(f"  --use-test-dataset: {params.use_test_dataset}")
+    print(f"  --manifest-dir: {params.manifest_dir}")
+    print("=" * 80)
+
     # Choose dataset based on parameters
     if params.use_test_dataset or params.dataset == "test":
         logging.info("Using synthetic test dataset")
+        print("[DEBUG] Loading from: data/fbank/test_dataset/test_cuts_*.jsonl.gz")
         cuts_train = multi_dataset.test_dataset_train_cuts()
         cuts_valid = multi_dataset.test_dataset_dev_cuts()
     elif params.dataset == "aishell":
         logging.info("Using AISHELL-1 dataset")
+        print("[DEBUG] Loading from: data/fbank/aishell_cuts_*.jsonl.gz")
         cuts_train = multi_dataset.aishell_train_cuts()
         cuts_valid = multi_dataset.aishell_dev_cuts()
     elif params.dataset == "all":
         logging.info("Using all Chinese ASR datasets")
+        print("[DEBUG] Loading from: multiple datasets (aishell, aishell2, wenetspeech, etc.)")
         cuts_train = multi_dataset.train_cuts()
         cuts_valid = multi_dataset.dev_cuts()
     elif params.dataset == "custom":
         logging.info("Using custom dataset (urls.txt + ref.txt)")
+        print("[DEBUG] Loading from: custom dataset")
         cuts_train = multi_dataset.custom_train_cuts()
         cuts_valid = multi_dataset.custom_dev_cuts()
+    elif params.dataset == "test_augmented":
+        logging.info("Using augmented test dataset (with pause extension and no-speech samples)")
+        print("[DEBUG] Loading from: data/fbank/dataset_test_augmented/dataset_test_aug_cuts_*.jsonl.gz")
+        cuts_train = multi_dataset.dataset_test_augmented_train_cuts()
+        cuts_valid = multi_dataset.dataset_test_augmented_dev_cuts()
+    elif params.dataset == "test_augmented_v2":
+        logging.info("Using augmented test dataset v2 (10% pause+background, 5% no-speech)")
+        print("[DEBUG] Loading from: data/fbank/dataset_test_augmented_v2/dataset_test_cuts_*.jsonl.gz")
+        cuts_train = multi_dataset.dataset_test_augmented_v2_train_cuts()
+        cuts_valid = multi_dataset.dataset_test_augmented_v2_dev_cuts()
     else:
         raise ValueError(f"Unknown dataset: {params.dataset}")
+
+    # Debug: Print loaded dataset info (without consuming the iterator)
+    print("=" * 80)
+    print("[DEBUG] Dataset objects created successfully")
+    print(f"  Train cuts type: {type(cuts_train)}")
+    print(f"  Valid cuts type: {type(cuts_valid)}")
+    print("=" * 80)
 
     sys.stdout.flush()
 
